@@ -1,0 +1,1836 @@
+"""
+=============================================================================
+                  WRAD - AUTOMOTIVE TINTING STUDIO
+    Application Web Streamlit de Métrage, Plan de Coupe & Rentabilité
+=============================================================================
+Architecture : Python 3.9+ | Streamlit (Web & Cloud) | Supabase Cloud | Gemini AI
+Conformité Cloud : 100% headless, zéro dépendance Tkinter (compatible Streamlit Cloud)
+Charte Graphique : Identité Officielle Wrad (Noir Carbone & Rouge Course #E10600)
+Contact : 07 67 60 10 98 | wradauto@gmail.com | Instagram: @wradauto
+=============================================================================
+"""
+
+import os
+import json
+import io
+import math
+import re
+import urllib.request
+import urllib.error
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # Mode headless pour le Cloud (aucun display X11 requis)
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    HAS_MATPLOTLIB = True
+except Exception:
+    HAS_MATPLOTLIB = False
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# =============================================================================
+# CODES COULEURS & CHARTE VISUELLE WRAD
+# =============================================================================
+COLOR_BG_DARK = "#09090b"        # Fond principal (Noir Onyx profond)
+COLOR_PANEL = "#121215"          # Panneaux de contenu
+COLOR_CARD = "#18181c"           # Cartes et conteneurs
+COLOR_BORDER = "#27272a"         # Bordures subtiles
+COLOR_RED_WRAD = "#E10600"       # Rouge Wrad officiel (Logo & Flyers)
+COLOR_RED_HOVER = "#B91C1C"      # Survol boutons rouges
+COLOR_RED_DARK = "#450a0a"       # Fond badges rouges
+COLOR_TEXT_WHITE = "#FFFFFF"     # Blanc
+COLOR_TEXT_MUTED = "#a1a1aa"     # Gris métallisé
+COLOR_PRICE_GOLD = "#fde047"     # Accent doré
+COLOR_SUCCESS = "#22c55e"        # Vert bénéfice
+COLOR_WARNING = "#ef4444"        # Rouge alerte dépassement laize
+
+# Rouleaux par défaut Wrad
+DEFAULT_ROLLS = [
+    {"id": "roll-76-30", "nom": "Rouleau Standard Wrad 76cm (Teinte 15% Black)", "laize_cm": 76.0, "longueur_m": 30.0, "prix_achat_ttc": 188.0, "isDefault": True},
+    {"id": "roll-100-30", "nom": "Rouleau Large 100cm (Carbone 5% Limousine)", "laize_cm": 100.0, "longueur_m": 30.0, "prix_achat_ttc": 248.0},
+    {"id": "roll-152-30", "nom": "Rouleau Extra-Large 152cm (Nano-Céramique 20%)", "laize_cm": 152.0, "longueur_m": 30.0, "prix_achat_ttc": 365.0},
+    {"id": "roll-50-30", "nom": "Rouleau Étroit 50cm (Homologué Avant 70%)", "laize_cm": 50.0, "longueur_m": 30.0, "prix_achat_ttc": 125.0},
+]
+
+# =============================================================================
+# GESTION DES IDENTIFIANTS SUPABASE (SECRETS STREAMLIT, ENV & INTERFACE)
+# =============================================================================
+def get_supabase_config() -> Tuple[str, str]:
+    """
+    Récupère l'URL et la clé Supabase selon l'ordre de priorité :
+    1. Saisie manuelle utilisateur en session (si configurée dans l'interface)
+    2. Streamlit Cloud Secrets (st.secrets["SUPABASE_URL"] & st.secrets["SUPABASE_ANON_KEY"] ou ["SUPABASE_KEY"])
+    3. Variables d'environnement système (.env / VITE_SUPABASE_*)
+    4. Identifiants par défaut du projet Supabase Wrad
+    """
+    override_url = st.session_state.get("custom_supabase_url")
+    override_key = st.session_state.get("custom_supabase_key")
+    if override_url and override_key:
+        return override_url.strip().rstrip("/"), override_key.strip()
+
+    url = None
+    key = None
+
+    # Lecture sécurisée depuis st.secrets (Streamlit Cloud natif)
+    try:
+        if hasattr(st, "secrets") and st.secrets is not None:
+            if "SUPABASE_URL" in st.secrets:
+                url = str(st.secrets["SUPABASE_URL"])
+            elif "supabase" in st.secrets and "url" in st.secrets["supabase"]:
+                url = str(st.secrets["supabase"]["url"])
+
+            if "SUPABASE_ANON_KEY" in st.secrets:
+                key = str(st.secrets["SUPABASE_ANON_KEY"])
+            elif "SUPABASE_KEY" in st.secrets:
+                key = str(st.secrets["SUPABASE_KEY"])
+            elif "supabase" in st.secrets and "key" in st.secrets["supabase"]:
+                key = str(st.secrets["supabase"]["key"])
+    except Exception:
+        pass
+
+    # Fallback variables d'environnement
+    if not url:
+        url = os.environ.get("SUPABASE_URL") or os.environ.get("VITE_SUPABASE_URL")
+    if not key:
+        key = os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("VITE_SUPABASE_ANON_KEY")
+
+    # Identifiants du projet Wrad
+    if not url:
+        url = "https://grnpluqowqgprmqwxify.supabase.co"
+    if not key:
+        key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdybnBsdXFvd3FncHJtcXd4aWZ5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI1Nzk5ODksImV4cCI6MjEwODE1NTk4OX0.RyiCSnVA1HDf0RSpVamkFXwaJZbff9RT_GazgdVUwUki"
+
+    return url.strip().rstrip("/"), key.strip()
+
+
+# Script SQL prêt à l'emploi pour initialiser les tables Supabase
+SUPABASE_SQL_SETUP = """-- =====================================================================
+-- SCRIPT SQL D'INITIALISATION WRAD TINT STUDIO DANS SUPABASE
+-- À exécuter dans Supabase : Dashboard > SQL Editor > New query
+-- =====================================================================
+
+-- 1. Table des Clients & Prestations de pose
+CREATE TABLE IF NOT EXISTS public.clients (
+  id TEXT PRIMARY KEY,
+  "clientNom" TEXT,
+  client_nom TEXT,
+  vehicule TEXT,
+  "datePose" TEXT,
+  date_pose TEXT,
+  pack TEXT,
+  "metrageUtiliseM" NUMERIC DEFAULT 0,
+  metrage_utilise_m NUMERIC DEFAULT 0,
+  "prixFactureTTC" NUMERIC DEFAULT 0,
+  prix_facture_ttc NUMERIC DEFAULT 0,
+  "coutRevientTTC" NUMERIC DEFAULT 0,
+  cout_revient_ttc NUMERIC DEFAULT 0,
+  "beneficeNetTTC" NUMERIC DEFAULT 0,
+  benefice_net_ttc NUMERIC DEFAULT 0,
+  "tauxMargePercent" NUMERIC DEFAULT 0,
+  taux_marge_percent NUMERIC DEFAULT 0,
+  notes TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 2. Table des Rouleaux de film (Laizes & Tarifs)
+CREATE TABLE IF NOT EXISTS public.rolls (
+  id TEXT PRIMARY KEY,
+  nom TEXT NOT NULL,
+  laize_cm NUMERIC NOT NULL,
+  longueur_m NUMERIC NOT NULL,
+  prix_achat_ttc NUMERIC NOT NULL,
+  "isDefault" BOOLEAN DEFAULT FALSE,
+  is_default BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 3. Table du Catalogue Véhicules & Cotes des Vitres
+CREATE TABLE IF NOT EXISTS public.vehicles (
+  id TEXT PRIMARY KEY,
+  key TEXT,
+  marque TEXT NOT NULL,
+  modele TEXT NOT NULL,
+  annee TEXT,
+  generation TEXT,
+  vitres JSONB NOT NULL DEFAULT '[]'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 4. Permissions d'accès public (anon)
+ALTER TABLE public.clients ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.rolls ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.vehicles ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Allow anon all on clients" ON public.clients;
+CREATE POLICY "Allow anon all on clients" ON public.clients FOR ALL TO anon USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Allow anon all on rolls" ON public.rolls;
+CREATE POLICY "Allow anon all on rolls" ON public.rolls FOR ALL TO anon USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Allow anon all on vehicles" ON public.vehicles;
+CREATE POLICY "Allow anon all on vehicles" ON public.vehicles FOR ALL TO anon USING (true) WITH CHECK (true);
+"""
+
+
+class PersistenceResult:
+    """Résultat d'opération compatible booléen et unpacking (ok, message)."""
+    def __init__(self, ok: bool, message: str = ""):
+        self.ok = ok
+        self.message = message
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    def __iter__(self):
+        return iter((self.ok, self.message))
+
+    def __repr__(self) -> str:
+        return f"PersistenceResult(ok={self.ok}, message='{self.message}')"
+
+
+# =============================================================================
+# PERSISTANCE DIRECTE SUPABASE (REST API TEMPS RÉEL SANS STOCKAGE LOCAL)
+# =============================================================================
+class PersistenceManager:
+    """
+    Gestionnaire de persistance 100% Cloud Supabase.
+    Toutes les opérations d'écriture et de lecture s'exécutent directement
+    contre les tables distantes Supabase (PostgREST API).
+    Zéro dépendance sur le stockage local éphémère de Streamlit Cloud.
+    """
+
+    @staticmethod
+    def _supabase_request(endpoint: str, method: str = "GET", data: Any = None) -> Tuple[bool, Any, Optional[str]]:
+        url, key = get_supabase_config()
+        if not url or not key:
+            return False, None, "URL ou clé API Supabase absente."
+
+        full_url = f"{url}/rest/v1/{endpoint}"
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation,resolution=merge-duplicates"
+        }
+
+        # Mécanisme d'adaptation automatique si des colonnes n'existent pas dans la table
+        working_data = json.loads(json.dumps(data)) if data is not None else None
+        max_retries = 3
+
+        for _ in range(max_retries):
+            try:
+                req_data = json.dumps(working_data).encode("utf-8") if working_data is not None else None
+                req = urllib.request.Request(full_url, data=req_data, headers=headers, method=method)
+                with urllib.request.urlopen(req, timeout=10) as res:
+                    body = res.read().decode("utf-8")
+                    parsed = json.loads(body) if body else []
+                    return True, parsed, None
+            except urllib.error.HTTPError as he:
+                try:
+                    err_body = he.read().decode("utf-8", "ignore")
+                    err_json = json.loads(err_body)
+                    msg = err_json.get("message") or err_json.get("hint") or str(err_json)
+                except Exception:
+                    msg = str(he)
+
+                # Si erreur de colonne inconnue, la retirer du payload et réessayer
+                if he.code == 400 and 'column "' in msg and '" of relation "' in msg:
+                    match = re.search(r'column "([^"]+)"', msg)
+                    if match:
+                        col_to_remove = match.group(1)
+                        if isinstance(working_data, list):
+                            for item in working_data:
+                                if isinstance(item, dict) and col_to_remove in item:
+                                    del item[col_to_remove]
+                            continue
+                        elif isinstance(working_data, dict) and col_to_remove in working_data:
+                            del working_data[col_to_remove]
+                            continue
+
+                # Enregistrement pour diagnostic dans la session
+                st.session_state["_last_supabase_error"] = f"Code {he.code}: {msg}"
+                return False, None, f"Supabase ({he.code}): {msg}"
+            except Exception as e:
+                st.session_state["_last_supabase_error"] = str(e)
+                return False, None, f"Erreur réseau Supabase: {e}"
+
+        return False, None, "Échec de synchronisation Supabase après tentatives d'adaptation du schéma."
+
+    @staticmethod
+    def test_connection() -> Dict[str, Any]:
+        """Teste la connexion réelle à Supabase et la présence des tables."""
+        url, key = get_supabase_config()
+        if not url or not key:
+            return {"status": "error", "message": "Identifiants Supabase non configurés."}
+
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}"
+        }
+
+        # 1. Ping de l'API root
+        try:
+            req = urllib.request.Request(f"{url}/rest/v1/?apikey={key}", headers=headers)
+            with urllib.request.urlopen(req, timeout=6):
+                pass
+        except urllib.error.HTTPError as he:
+            if he.code == 401:
+                return {
+                    "status": "unauthorized",
+                    "code": 401,
+                    "message": "Clé API anon invalide ou expirée pour ce projet Supabase."
+                }
+        except Exception as e:
+            return {"status": "network_error", "message": str(e)}
+
+        # 2. Vérification de l'existence des tables
+        missing = []
+        for tbl in ["vehicles", "clients", "rolls"]:
+            try:
+                req = urllib.request.Request(f"{url}/rest/v1/{tbl}?select=id&limit=1", headers=headers)
+                with urllib.request.urlopen(req, timeout=6):
+                    pass
+            except urllib.error.HTTPError as he:
+                if he.code in (400, 404):
+                    missing.append(tbl)
+            except Exception:
+                pass
+
+        if missing:
+            return {
+                "status": "missing_tables",
+                "missing": missing,
+                "message": f"Tables absentes dans Supabase : {', '.join(missing)}"
+            }
+
+        return {"status": "connected", "message": "Supabase connecté et tables synchronisées !"}
+
+    @staticmethod
+    def load_database() -> Dict[str, Any]:
+        """Charge l'ensemble des véhicules directement depuis la table Supabase 'vehicles'."""
+        success, supa_res, err_msg = PersistenceManager._supabase_request("vehicles?select=*")
+        if success and isinstance(supa_res, list):
+            db_map = {}
+            for v in supa_res:
+                k = v.get("key") or v.get("id")
+                if not k:
+                    continue
+                vitres = v.get("vitres", [])
+                if isinstance(vitres, str):
+                    try:
+                        vitres = json.loads(vitres)
+                    except Exception:
+                        vitres = []
+                db_map[k] = {
+                    "marque": v.get("marque", ""),
+                    "modele": v.get("modele", ""),
+                    "annee": v.get("annee", ""),
+                    "generation": v.get("generation", ""),
+                    "vitres": vitres
+                }
+            return db_map
+
+        if err_msg:
+            st.session_state["_last_db_error"] = err_msg
+        return {}
+
+    @staticmethod
+    def save_vehicle(key: str, data: Dict[str, Any]) -> PersistenceResult:
+        """Enregistre un véhicule directement dans la table Supabase 'vehicles'."""
+        payload = {
+            "id": str(key),
+            "key": str(key),
+            "marque": str(data.get("marque", "")).strip(),
+            "modele": str(data.get("modele", "")).strip(),
+            "annee": str(data.get("annee", "")).strip(),
+            "generation": str(data.get("generation", "")).strip() or "Saisie Manuelle",
+            "vitres": data.get("vitres", [])
+        }
+        success, _, err_msg = PersistenceManager._supabase_request("vehicles", method="POST", data=[payload])
+        if success:
+            return PersistenceResult(True, "Véhicule et cotes enregistrés en direct dans Supabase !")
+        return PersistenceResult(False, err_msg or "Erreur inconnue lors de l'enregistrement dans Supabase.")
+
+    @staticmethod
+    def delete_vehicle(key: str) -> PersistenceResult:
+        """Supprime un véhicule directement de la table Supabase 'vehicles'."""
+        s1, _, e1 = PersistenceManager._supabase_request(f"vehicles?id=eq.{key}", method="DELETE")
+        s2, _, e2 = PersistenceManager._supabase_request(f"vehicles?key=eq.{key}", method="DELETE")
+        if s1 or s2:
+            return PersistenceResult(True, "Véhicule supprimé de la table Supabase.")
+        return PersistenceResult(False, e1 or e2 or "Échec de la suppression dans Supabase.")
+
+    @staticmethod
+    def load_clients() -> List[Dict[str, Any]]:
+        """Charge l'historique complet des clients directement depuis la table Supabase 'clients'."""
+        success, supa_res, _ = PersistenceManager._supabase_request("clients?select=*&order=created_at.desc")
+        if not success or not isinstance(supa_res, list):
+            success, supa_res, err_msg = PersistenceManager._supabase_request("clients?select=*")
+
+        if success and isinstance(supa_res, list):
+            formatted = []
+            for c in supa_res:
+                formatted.append({
+                    "id": str(c.get("id")),
+                    "clientNom": c.get("clientNom") or c.get("client_nom") or "Client",
+                    "vehicule": c.get("vehicule", ""),
+                    "datePose": c.get("datePose") or c.get("date_pose") or "",
+                    "pack": c.get("pack", ""),
+                    "metrageUtiliseM": float(c.get("metrageUtiliseM") or c.get("metrage_utilise_m") or 0),
+                    "prixFactureTTC": float(c.get("prixFactureTTC") or c.get("prix_facture_ttc") or 0),
+                    "coutRevientTTC": float(c.get("coutRevientTTC") or c.get("cout_revient_ttc") or 0),
+                    "beneficeNetTTC": float(c.get("beneficeNetTTC") or c.get("benefice_net_ttc") or 0),
+                    "tauxMargePercent": float(c.get("tauxMargePercent") or c.get("taux_marge_percent") or 0),
+                    "notes": c.get("notes") or ""
+                })
+            return formatted
+
+        return []
+
+    @staticmethod
+    def save_client_record(record: Dict[str, Any]) -> PersistenceResult:
+        """Enregistre une nouvelle prestation client directement dans la table Supabase 'clients'."""
+        payload = {
+            "id": str(record.get("id")),
+            "clientNom": str(record.get("clientNom") or ""),
+            "client_nom": str(record.get("clientNom") or ""),
+            "vehicule": str(record.get("vehicule") or ""),
+            "datePose": str(record.get("datePose") or ""),
+            "date_pose": str(record.get("datePose") or ""),
+            "pack": str(record.get("pack") or ""),
+            "metrageUtiliseM": float(record.get("metrageUtiliseM") or 0),
+            "metrage_utilise_m": float(record.get("metrageUtiliseM") or 0),
+            "prixFactureTTC": float(record.get("prixFactureTTC") or 0),
+            "prix_facture_ttc": float(record.get("prixFactureTTC") or 0),
+            "coutRevientTTC": float(record.get("coutRevientTTC") or 0),
+            "cout_revient_ttc": float(record.get("coutRevientTTC") or 0),
+            "beneficeNetTTC": float(record.get("beneficeNetTTC") or 0),
+            "benefice_net_ttc": float(record.get("beneficeNetTTC") or 0),
+            "tauxMargePercent": float(record.get("tauxMargePercent") or 0),
+            "taux_marge_percent": float(record.get("tauxMargePercent") or 0),
+            "notes": str(record.get("notes") or "")
+        }
+        success, _, err_msg = PersistenceManager._supabase_request("clients", method="POST", data=[payload])
+        if success:
+            return PersistenceResult(True, "Prestation client enregistrée en direct dans Supabase !")
+        return PersistenceResult(False, err_msg or "Échec de l'enregistrement de la pose client dans Supabase.")
+
+    @staticmethod
+    def delete_client_record(cid: str) -> PersistenceResult:
+        """Supprime une prestation client directement de la table Supabase 'clients'."""
+        success, _, err_msg = PersistenceManager._supabase_request(f"clients?id=eq.{cid}", method="DELETE")
+        if success:
+            return PersistenceResult(True, "Prestation supprimée de Supabase.")
+        return PersistenceResult(False, err_msg or "Échec de la suppression dans Supabase.")
+
+    @staticmethod
+    def load_rolls() -> List[Dict[str, Any]]:
+        """Charge les rouleaux directement depuis la table Supabase 'rolls'."""
+        success, supa_res, _ = PersistenceManager._supabase_request("rolls?select=*")
+        if success and isinstance(supa_res, list) and len(supa_res) > 0:
+            formatted = []
+            for r in supa_res:
+                formatted.append({
+                    "id": str(r.get("id")),
+                    "nom": str(r.get("nom")),
+                    "laize_cm": float(r.get("laize_cm") or 76.0),
+                    "longueur_m": float(r.get("longueur_m") or 30.0),
+                    "prix_achat_ttc": float(r.get("prix_achat_ttc") or 188.0),
+                    "isDefault": bool(r.get("isDefault", False) or r.get("is_default", False))
+                })
+            return formatted
+
+        # Valeurs initiales par défaut Wrad
+        return list(DEFAULT_ROLLS)
+
+    @staticmethod
+    def save_rolls(data: List[Dict[str, Any]]) -> PersistenceResult:
+        """Sauvegarde les rouleaux directement dans la table Supabase 'rolls'."""
+        payloads = []
+        for r in data:
+            payloads.append({
+                "id": str(r.get("id")),
+                "nom": str(r.get("nom")),
+                "laize_cm": float(r.get("laize_cm")),
+                "longueur_m": float(r.get("longueur_m")),
+                "prix_achat_ttc": float(r.get("prix_achat_ttc")),
+                "isDefault": bool(r.get("isDefault", False)),
+                "is_default": bool(r.get("isDefault", False))
+            })
+        success, _, err_msg = PersistenceManager._supabase_request("rolls", method="POST", data=payloads)
+        if success:
+            return PersistenceResult(True, "Rouleaux sauvegardés dans Supabase.")
+        return PersistenceResult(False, err_msg or "Échec de la sauvegarde des rouleaux dans Supabase.")
+
+
+# =============================================================================
+# MOTEUR TECHNIQUE : SENS DU FILM STRICTEMENT HORIZONTAL
+# =============================================================================
+class StrictHorizontalNestingEngine:
+    """
+    Règle physique impérative : Le film teinté s'utilise uniquement de façon horizontale.
+    - Hauteur vitre (+ marge) alignée sur la Laize du rouleau.
+    - Largeur vitre (+ marge) alignée sur la Longueur du déroulé du rouleau.
+    - Zéro rotation à 90° autorisée.
+    """
+
+    @staticmethod
+    def compute(vitres: List[Dict[str, Any]], laize_cm: float = 76.0, marge_cm: float = 5.0) -> Dict[str, Any]:
+        active_items = [v for v in vitres if v.get("included", True)]
+        if not active_items:
+            return {
+                "placed": [],
+                "unfitted": [],
+                "total_linear_cm": 0,
+                "total_linear_m": 0.0,
+                "surface_used_m2": 0.0,
+                "surface_cut_m2": 0.0,
+                "efficiency_pct": 0.0,
+                "has_seam_warning": False,
+                "svg_html": ""
+            }
+
+        candidates = []
+        for v in active_items:
+            raw_h = float(v.get("hauteur_cm", 45))
+            raw_w = float(v.get("largeur_cm", 60))
+            h_laize = max(1.0, raw_h + marge_cm)
+            w_roll = max(1.0, raw_w + marge_cm)
+            fits = h_laize <= laize_cm
+            candidates.append({
+                "raw": v,
+                "h_laize": h_laize,
+                "w_roll": w_roll,
+                "fits": fits,
+                "exceeds_by": max(0.0, h_laize - laize_cm)
+            })
+
+        # Tri par hauteur décroissante sur laize
+        candidates.sort(key=lambda x: (x["h_laize"], x["w_roll"]), reverse=True)
+
+        stripes = []
+        placed = []
+        unfitted = []
+        has_seam_warning = False
+
+        for c in candidates:
+            h_laize = c["h_laize"]
+            w_roll = c["w_roll"]
+            v = c["raw"]
+
+            if not c["fits"]:
+                has_seam_warning = True
+                unfitted.append({
+                    "nom": v.get("nom", "Vitre"),
+                    "zone": v.get("zone", "arriere"),
+                    "h_laize": h_laize,
+                    "w_roll": w_roll,
+                    "exceeds_by": c["exceeds_by"]
+                })
+
+                start_y = sum(s["length"] for s in stripes)
+                stripes.append({
+                    "y": start_y,
+                    "length": w_roll,
+                    "used_laize": laize_cm
+                })
+
+                placed.append({
+                    "nom": v.get("nom", "Vitre"),
+                    "zone": v.get("zone", "arriere"),
+                    "x": 0.0,
+                    "y": start_y,
+                    "height_on_laize": h_laize,
+                    "width_on_roll": w_roll,
+                    "raw_h": v.get("hauteur_cm", 45),
+                    "raw_w": v.get("largeur_cm", 60),
+                    "fits": False,
+                    "exceeds_by": c["exceeds_by"]
+                })
+                continue
+
+            best_stripe_idx = -1
+            min_leftover = float("inf")
+
+            for s_idx, stripe in enumerate(stripes):
+                remaining_laize = laize_cm - stripe["used_laize"]
+                if remaining_laize >= h_laize:
+                    leftover = remaining_laize - h_laize
+                    if leftover < min_leftover:
+                        min_leftover = leftover
+                        best_stripe_idx = s_idx
+
+            if best_stripe_idx != -1:
+                stripe = stripes[best_stripe_idx]
+                placed.append({
+                    "nom": v.get("nom", "Vitre"),
+                    "zone": v.get("zone", "arriere"),
+                    "x": stripe["used_laize"],
+                    "y": stripe["y"],
+                    "height_on_laize": h_laize,
+                    "width_on_roll": w_roll,
+                    "raw_h": v.get("hauteur_cm", 45),
+                    "raw_w": v.get("largeur_cm", 60),
+                    "fits": True,
+                    "exceeds_by": 0.0
+                })
+                stripe["used_laize"] += h_laize
+                stripe["length"] = max(stripe["length"], w_roll)
+            else:
+                start_y = sum(s["length"] for s in stripes)
+                stripes.append({
+                    "y": start_y,
+                    "length": w_roll,
+                    "used_laize": h_laize
+                })
+                placed.append({
+                    "nom": v.get("nom", "Vitre"),
+                    "zone": v.get("zone", "arriere"),
+                    "x": 0.0,
+                    "y": start_y,
+                    "height_on_laize": h_laize,
+                    "width_on_roll": w_roll,
+                    "raw_h": v.get("hauteur_cm", 45),
+                    "raw_w": v.get("largeur_cm", 60),
+                    "fits": True,
+                    "exceeds_by": 0.0
+                })
+
+        total_linear_cm = sum(s["length"] for s in stripes)
+        total_linear_m = round(total_linear_cm / 100.0, 2)
+        total_used_cm2 = total_linear_cm * laize_cm
+        cut_area_cm2 = sum(p["height_on_laize"] * p["width_on_roll"] for p in placed)
+        eff_pct = round((cut_area_cm2 / total_used_cm2 * 100.0), 1) if total_used_cm2 > 0 else 0.0
+
+        # Construction du plan de coupe en SVG interactif
+        svg_code = StrictHorizontalNestingEngine._generate_svg(placed, laize_cm, total_linear_cm, total_linear_m, has_seam_warning)
+
+        return {
+            "placed": placed,
+            "unfitted": unfitted,
+            "total_linear_cm": total_linear_cm,
+            "total_linear_m": total_linear_m,
+            "surface_used_m2": round(total_used_cm2 / 10000.0, 3),
+            "surface_cut_m2": round(cut_area_cm2 / 10000.0, 3),
+            "efficiency_pct": eff_pct,
+            "has_seam_warning": has_seam_warning,
+            "svg_html": svg_code
+        }
+
+    @staticmethod
+    def _generate_svg(placed: List[Dict[str, Any]], laize_cm: float, total_cm: float, total_m: float, has_seam: bool) -> str:
+        view_len = max(80.0, total_cm + 20)
+        scale = 3.2
+        roll_w = laize_cm * scale
+        roll_h = view_len * scale
+        pad_x = 40
+        pad_y = 35
+
+        svg_w = roll_w + (pad_x * 2) + 70
+        svg_h = max(300, roll_h + (pad_y * 2))
+
+        rects = []
+        for p in placed:
+            x = pad_x + (p["x"] * scale)
+            y = pad_y + (p["y"] * scale)
+            w = p["height_on_laize"] * scale
+            h = p["width_on_roll"] * scale
+            exceeds = not p.get("fits", True)
+
+            fill_color = "rgba(127, 29, 29, 0.8)" if exceeds else ("rgba(225, 6, 0, 0.55)" if p["zone"] == "arriere" else "rgba(37, 99, 235, 0.55)")
+            stroke_color = "#ef4444" if exceeds else ("#E10600" if p["zone"] == "arriere" else "#3b82f6")
+
+            txt_info = f"{p['nom'][:14]} ({p['height_on_laize']:.0f}×{p['width_on_roll']:.0f}cm)"
+            if exceeds:
+                txt_info += f" ⚠️ +{p['exceeds_by']:.0f}cm"
+
+            rects.append(f"""
+                <g>
+                    <rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="4"
+                          fill="{fill_color}" stroke="{stroke_color}" stroke-width="1.8" />
+                    <text x="{(x + (w/2)):.1f}" y="{(y + (h/2)):.1f}" font-size="10" font-family="sans-serif"
+                          font-weight="bold" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">
+                        {txt_info}
+                    </text>
+                </g>
+            """)
+
+        seam_badge = """
+            <rect x="20" y="8" width="530" height="22" rx="4" fill="#450a0a" stroke="#ef4444" stroke-width="1" />
+            <text x="30" y="23" font-size="11" font-weight="bold" fill="#fca5a5" font-family="sans-serif">
+                ⚠️ ALERTE RACCORD : Au moins une hauteur dépasse la laize (rouleau plus large requis)
+            </text>
+        """ if has_seam else ""
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body {{
+            margin: 0;
+            padding: 8px;
+            background-color: #09090b;
+            color: #e4e4e7;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }}
+        .container {{
+            background: #121215;
+            border: 1px solid #27272a;
+            border-radius: 8px;
+            padding: 10px;
+            overflow-x: auto;
+            box-sizing: border-box;
+        }}
+        .legend {{
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            font-size: 11px;
+            margin-bottom: 8px;
+            color: #a1a1aa;
+            flex-wrap: wrap;
+        }}
+        .badge {{
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+            margin-right: 4px;
+            vertical-align: middle;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="legend">
+            <div><span class="badge" style="background:#E10600; border:1px solid #f87171;"></span> Pack 3/4 Arrière</div>
+            <div><span class="badge" style="background:#2563eb; border:1px solid #60a5fa;"></span> Pack Vitres Avant</div>
+            <div><span class="badge" style="background:#ef4444; border:1px solid #fca5a5;"></span> Dépassement Laize</div>
+            <div style="margin-left:auto; font-weight:bold; color:#E10600;">Métrage total : {total_m:.2f} m</div>
+        </div>
+        <svg width="100%" height="{min(460, int(svg_h))}" viewBox="0 0 {svg_w} {svg_h}" xmlns="http://www.w3.org/2000/svg">
+            {seam_badge}
+            <!-- Rouleau de film -->
+            <rect x="{pad_x}" y="{pad_y}" width="{roll_w}" height="{roll_h}"
+                  fill="#18181b" stroke="#3f3f46" stroke-width="2" rx="4" />
+            
+            <!-- Règle de laize supérieure -->
+            <text x="{pad_x + (roll_w / 2)}" y="{pad_y - 10}" font-size="11" font-family="sans-serif"
+                  font-weight="bold" fill="#a1a1aa" text-anchor="middle">
+                ← Laize du rouleau : {laize_cm:.0f} cm →
+            </text>
+
+            <!-- Découpes positionnées -->
+            {''.join(rects)}
+
+            <!-- Règle latérale de métrage linéaire -->
+            <line x1="{pad_x + roll_w + 12}" y1="{pad_y}" x2="{pad_x + roll_w + 12}" y2="{pad_y + (total_cm * scale)}"
+                  stroke="#E10600" stroke-width="2" />
+            <text x="{pad_x + roll_w + 20}" y="{pad_y + ((total_cm * scale) / 2)}"
+                  font-size="12" font-weight="bold" fill="#E10600" font-family="monospace">
+                {total_m:.2f} m
+            </text>
+        </svg>
+    </div>
+</body>
+</html>"""
+        return html
+
+    @staticmethod
+    def generate_matplotlib_fig(placed: List[Dict[str, Any]], laize_cm: float, total_cm: float, total_m: float, has_seam: bool):
+        if not HAS_MATPLOTLIB or not placed:
+            return None
+        try:
+            fig_w = 9.0
+            fig_h = max(4.0, min(14.0, total_cm * 0.025 + 2.5))
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="#09090b")
+            ax.set_facecolor("#121215")
+
+            roll_len = max(50.0, total_cm)
+            roll_patch = patches.Rectangle((0, 0), laize_cm, roll_len,
+                                           linewidth=1.5, edgecolor="#52525b", facecolor="#18181b", linestyle="--")
+            ax.add_patch(roll_patch)
+
+            for p in placed:
+                x = p["x"]
+                y = p["y"]
+                w = p["height_on_laize"]
+                h = p["width_on_roll"]
+                exceeds = not p.get("fits", True)
+
+                if exceeds:
+                    fc = "#7f1d1d"
+                    ec = "#ef4444"
+                elif p.get("zone") == "arriere":
+                    fc = "#991b1b"
+                    ec = "#E10600"
+                else:
+                    fc = "#1e3a8a"
+                    ec = "#3b82f6"
+
+                rect = patches.Rectangle((x, y), w, h, linewidth=1.2, edgecolor=ec, facecolor=fc, alpha=0.85)
+                ax.add_patch(rect)
+
+                lbl = f"{p.get('nom', 'Vitre')[:14]}\n{w:.0f}×{h:.0f} cm"
+                if exceeds:
+                    lbl += f"\n⚠️ Dépasse +{p.get('exceeds_by', 0):.0f}cm"
+                ax.text(x + w / 2, y + h / 2, lbl, color="white", fontsize=8, weight="bold",
+                        ha="center", va="center", clip_on=True)
+
+            ax.set_xlim(-8, laize_cm + 12)
+            ax.set_ylim(-8, roll_len + 15)
+            ax.set_xlabel(f"Largeur du rouleau (Laize fixe : {laize_cm:.0f} cm)", color="#a1a1aa", fontsize=9, weight="bold")
+            ax.set_ylabel(f"Longueur déroulée ({total_m:.2f} m / {total_cm:.0f} cm)", color="#E10600", fontsize=9, weight="bold")
+            ax.tick_params(colors="#a1a1aa", labelsize=8)
+
+            for spine in ax.spines.values():
+                spine.set_color("#27272a")
+
+            ax.grid(color="#27272a", linestyle=":", linewidth=0.6, alpha=0.8)
+
+            title_txt = f"Plan de Coupe Wrad 2D • Total : {total_m:.2f} m"
+            if has_seam:
+                title_txt += " ⚠️ [ALERTE RACCORD NÉCESSAIRE]"
+            ax.set_title(title_txt, color="#ffffff", fontsize=10, weight="bold", pad=10)
+
+            plt.tight_layout()
+            return fig
+        except Exception:
+            return None
+
+
+# =============================================================================
+# ESTIMATION IA GEMINI
+# =============================================================================
+class GeminiEstimator:
+    @staticmethod
+    def estimate(marque: str, modele: str, annee: str = "") -> Dict[str, Any]:
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("Clé API absente. Mode local actif.")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+
+        system_instruction = (
+            "Tu es un métreur automobile expert en pose de films solaires pour 'Wrad'.\n"
+            "RÈGLES STRICTES :\n"
+            "1. AUCUN PARE-BRISE ne doit être inclus.\n"
+            "2. Liste toutes les vitres (Lunette arrière, vitres latérales arrière, custodes arrière, vitres avant, custodes avant).\n"
+            "3. Règle technique : la hauteur s'aligne sur la laize et la largeur sur la longueur.\n"
+            "4. Format JSON pur obligatoire :\n"
+            '{"generation": "string", "vitres": [{"nom": "string", "hauteur_cm": int, "largeur_cm": int, "zone": "avant" | "arriere"}]}'
+        )
+
+        prompt = f"Véhicule : {marque} {modele} {annee or 'récent'}. Dimensions réelles nettes en cm."
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}
+        }
+
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+
+        with urllib.request.urlopen(req, timeout=12) as response:
+            res_body = response.read().decode("utf-8")
+            res_json = json.loads(res_body)
+            raw_text = res_json.get("candidates", [])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            parsed = json.loads(raw_text)
+            vitres = parsed.get("vitres", [])
+            clean_vitres = []
+            for v in vitres:
+                zone = "avant" if "av" in str(v.get("zone", "")).lower() else "arriere"
+                clean_vitres.append({
+                    "nom": str(v.get("nom", "Vitre")),
+                    "hauteur_cm": int(v.get("hauteur_cm", 45)),
+                    "largeur_cm": int(v.get("largeur_cm", 60)),
+                    "zone": zone,
+                    "included": True
+                })
+            return {"generation": parsed.get("generation", "Estimé par IA"), "vitres": clean_vitres}
+
+
+# =============================================================================
+# GÉNÉRATEUR DE DEVIS PDF ÉPURÉ (WRAD)
+# =============================================================================
+class WradPDFGenerator:
+    """
+    Générateur de devis PDF vectoriel épuré pour l'atelier Wrad.
+    Suppression stricte des éléments superflus :
+    - Aucun slogan 'automotive tinting'
+    - Aucune description 'pose de films solaire haut de gamme & sécurité automobile'
+    - Aucun bloc argumentaire (Esthétique, Confort, Intimité, Protection 99% UV)
+    - Aucun bloc 'Engagements & Réglementations'
+    - Aucune mention 'Validité de l'offre'
+    """
+
+    @staticmethod
+    def generate_pdf_bytes(
+        devis_num: str,
+        date_str: str,
+        vehicule: Dict[str, Any],
+        prestation_title: str,
+        prestation_desc: str,
+        metrage_m: float,
+        prix_ttc: float,
+        roll_nom: str = "",
+        laize_cm: float = 76.0,
+        client_nom: str = ""
+    ) -> Optional[bytes]:
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib import colors
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import cm
+
+            buf = io.BytesIO()
+            doc = SimpleDocTemplate(
+                buf,
+                pagesize=A4,
+                rightMargin=2 * cm,
+                leftMargin=2 * cm,
+                topMargin=2 * cm,
+                bottomMargin=2 * cm
+            )
+
+            styles = getSampleStyleSheet()
+            red_wrad = colors.HexColor("#E10600")
+            dark_bg = colors.HexColor("#121215")
+            light_gray = colors.HexColor("#F4F4F5")
+            border_gray = colors.HexColor("#E4E4E7")
+            text_dark = colors.HexColor("#18181B")
+            text_muted = colors.HexColor("#71717A")
+
+            title_style = ParagraphStyle('WradTitle', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=26, leading=30, textColor=colors.black)
+            contact_style = ParagraphStyle('WradContact', parent=styles['Normal'], fontName='Helvetica', fontSize=9, leading=13, textColor=text_muted)
+            meta_right_style = ParagraphStyle('WradMetaRight', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=11, leading=15, alignment=2, textColor=red_wrad)
+            meta_date_style = ParagraphStyle('WradMetaDate', parent=styles['Normal'], fontName='Helvetica', fontSize=9, leading=13, alignment=2, textColor=text_muted)
+            section_title = ParagraphStyle('WradSection', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=10, leading=14, textColor=text_dark, spaceAfter=4)
+            table_header = ParagraphStyle('WradTH', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=9, leading=12, textColor=colors.white)
+            table_cell = ParagraphStyle('WradTD', parent=styles['Normal'], fontName='Helvetica', fontSize=9, leading=12, textColor=text_dark)
+            table_cell_bold = ParagraphStyle('WradTDBold', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=9, leading=12, textColor=text_dark)
+            table_cell_price = ParagraphStyle('WradTDPrice', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=10, leading=13, alignment=2, textColor=red_wrad)
+
+            story = []
+
+            # 1. En-tête épuré et coordonnées Wrad
+            header_data = [
+                [Paragraph("<b>WRAD</b>", title_style), Paragraph(f"DEVIS N° {devis_num}", meta_right_style)],
+                [
+                    Paragraph(
+                        "Atelier Wrad • Poitiers &amp; alentours (Atelier ou Domicile)<br/>"
+                        "Tél : 07 67 60 10 98 • Email : wradauto@gmail.com • Instagram : @wradauto",
+                        contact_style
+                    ),
+                    Paragraph(f"Date : {date_str}", meta_date_style)
+                ]
+            ]
+            t_header = Table(header_data, colWidths=[10 * cm, 7 * cm])
+            t_header.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                ('TOPPADDING', (0, 0), (-1, -1), 2),
+                ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+            ]))
+            story.append(t_header)
+            story.append(Spacer(1, 15))
+            story.append(HRFlowable(width="100%", thickness=1, color=border_gray, spaceAfter=15))
+
+            # 2. Coordonnées client & véhicule
+            marque = vehicule.get('marque', '')
+            modele = vehicule.get('modele', '')
+            annee = vehicule.get('annee', '')
+            gen = vehicule.get('generation', '')
+            veh_str = f"<b>{marque} {modele}</b>" + (f" ({annee})" if annee else "")
+            if gen and gen != "Estimé par IA":
+                veh_str += f"<br/><font color='#71717A' size='8'>{gen}</font>"
+
+            client_str = f"<b>{client_nom}</b>" if client_nom else "Client Particulier / Professionnel"
+
+            info_data = [
+                [Paragraph("<b>COORDONNÉES CLIENT</b>", section_title), Paragraph("<b>VÉHICULE CONCERNÉ</b>", section_title)],
+                [Paragraph(f"{client_str}<br/><font color='#71717A'>Pose de films solaires</font>", table_cell), Paragraph(veh_str, table_cell)]
+            ]
+            if roll_nom:
+                info_data.append([
+                    Paragraph("", table_cell),
+                    Paragraph(f"<font color='#71717A' size='8'>Film sélectionné : {roll_nom} (Laize {laize_cm:.0f} cm)</font>", table_cell)
+                ])
+
+            t_info = Table(info_data, colWidths=[8.5 * cm, 8.5 * cm])
+            t_info.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), light_gray),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('LEFTPADDING', (0, 0), (-1, -1), 10),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+                ('LINEBELOW', (0, 0), (-1, 0), 0.5, border_gray),
+            ]))
+            story.append(t_info)
+            story.append(Spacer(1, 20))
+
+            # 3. Tableau des prestations & chiffrage
+            story.append(Paragraph("<b>PRESTATION &amp; TARIFICATION</b>", section_title))
+            table_content = [
+                [Paragraph("Prestation", table_header), Paragraph("Détails des vitres incluses", table_header), Paragraph("Métrage", table_header), Paragraph("Tarif TTC", table_header)],
+                [Paragraph(prestation_title, table_cell_bold), Paragraph(prestation_desc, table_cell), Paragraph(f"{metrage_m:.2f} m", table_cell), Paragraph(f"<b>{prix_ttc:.2f} €</b>", table_cell_price)],
+                [Paragraph("<b>TOTAL CONSEILLÉ TTC</b>", table_cell_bold), Paragraph("", table_cell), Paragraph(f"<b>{metrage_m:.2f} m</b>", table_cell_bold), Paragraph(f"<b>{prix_ttc:.2f} € TTC</b>", table_cell_price)]
+            ]
+            t_presta = Table(table_content, colWidths=[4.5 * cm, 7.5 * cm, 2.5 * cm, 2.5 * cm])
+            t_presta.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), dark_bg),
+                ('ALIGN', (2, 0), (2, -1), 'CENTER'),
+                ('ALIGN', (3, 0), (3, -1), 'RIGHT'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, 1), 0.5, border_gray),
+                ('BACKGROUND', (0, 2), (-1, 2), light_gray),
+                ('LINEABOVE', (0, 2), (-1, 2), 1.5, dark_bg),
+                ('GRID', (0, 2), (-1, 2), 0.5, border_gray),
+            ]))
+            story.append(t_presta)
+            story.append(Spacer(1, 30))
+
+            # 4. Bas de page épuré
+            story.append(HRFlowable(width="100%", thickness=0.5, color=border_gray, spaceAfter=8))
+            footer_text = Paragraph(
+                "<font color='#71717A' size='8'>Atelier WRAD • Poitiers &amp; alentours • 07 67 60 10 98 • wradauto@gmail.com • Devis professionnel épuré</font>",
+                ParagraphStyle('Footer', alignment=1, fontName='Helvetica', fontSize=8)
+            )
+            story.append(footer_text)
+
+            doc.build(story)
+            buf.seek(0)
+            return buf.getvalue()
+        except Exception as e:
+            st.error(f"Erreur de création du PDF : {e}")
+            return None
+
+
+# =============================================================================
+# APPLICATION PRINCIPALE STREAMLIT
+# =============================================================================
+
+# Configuration de la page Streamlit
+st.set_page_config(
+    page_title="WRAD - Tint Studio | Métrage & Rentabilité",
+    page_icon="🚗",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Injection de style CSS Wrad (Sombre & Rouge Course)
+st.markdown(f"""
+<style>
+    /* Thème global Wrad */
+    .stApp {{
+        background-color: {COLOR_BG_DARK};
+        color: {COLOR_TEXT_WHITE};
+    }}
+    /* En-tête et boutons */
+    .stButton>button {{
+        background-color: {COLOR_RED_WRAD};
+        color: white;
+        font-weight: bold;
+        border-radius: 8px;
+        border: none;
+        transition: 0.2s;
+    }}
+    .stButton>button:hover {{
+        background-color: {COLOR_RED_HOVER};
+        color: white;
+    }}
+    /* Métriques financières */
+    [data-testid="stMetricValue"] {{
+        font-size: 1.5rem !important;
+        font-weight: 800 !important;
+        color: {COLOR_PRICE_GOLD} !important;
+    }}
+    /* Onglets */
+    .stTabs [data-baseweb="tab-list"] {{
+        gap: 8px;
+    }}
+    .stTabs [data-baseweb="tab"] {{
+        background-color: {COLOR_PANEL};
+        border-radius: 8px 8px 0px 0px;
+        padding: 8px 16px;
+        color: {COLOR_TEXT_MUTED};
+        font-weight: bold;
+    }}
+    .stTabs [aria-selected="true"] {{
+        background-color: {COLOR_CARD} !important;
+        color: {COLOR_RED_WRAD} !important;
+        border-bottom: 2px solid {COLOR_RED_WRAD} !important;
+    }}
+</style>
+""", unsafe_allow_html=True)
+
+# Initialisation du Session State
+if "rolls" not in st.session_state:
+    st.session_state["rolls"] = PersistenceManager.load_rolls()
+
+if "active_roll_idx" not in st.session_state:
+    st.session_state["active_roll_idx"] = 0
+
+if "coeff_prix" not in st.session_state:
+    st.session_state["coeff_prix"] = 2.0
+
+if "marge_coupe" not in st.session_state:
+    st.session_state["marge_coupe"] = 5.0
+
+if "vitres_data" not in st.session_state:
+    st.session_state["vitres_data"] = [
+        {"nom": "Lunette arrière", "hauteur_cm": 52, "largeur_cm": 98, "zone": "arriere", "included": True},
+        {"nom": "Vitre latérale arrière gauche", "hauteur_cm": 44, "largeur_cm": 56, "zone": "arriere", "included": True},
+        {"nom": "Vitre latérale arrière droite", "hauteur_cm": 44, "largeur_cm": 56, "zone": "arriere", "included": True},
+        {"nom": "Custode arrière gauche", "hauteur_cm": 28, "largeur_cm": 22, "zone": "arriere", "included": True},
+        {"nom": "Custode arrière droite", "hauteur_cm": 28, "largeur_cm": 22, "zone": "arriere", "included": True},
+        {"nom": "Vitre latérale avant gauche", "hauteur_cm": 48, "largeur_cm": 72, "zone": "avant", "included": True},
+        {"nom": "Vitre latérale avant droite", "hauteur_cm": 48, "largeur_cm": 72, "zone": "avant", "included": True},
+    ]
+
+if "current_vehicle_info" not in st.session_state:
+    st.session_state["current_vehicle_info"] = {
+        "marque": "Peugeot",
+        "modele": "208",
+        "annee": "2020",
+        "generation": "Génération II (2019-2024)"
+    }
+
+if "manual_new_vehicle_vitres" not in st.session_state:
+    st.session_state["manual_new_vehicle_vitres"] = []
+
+# =============================================================================
+# BARRE LATÉRALE (PARAMÈTRES ROULEAUX & SUPABASE)
+# =============================================================================
+with st.sidebar:
+    st.markdown("""
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:15px;">
+            <div style="font-size:26px; font-weight:900; color:#FFFFFF; letter-spacing:-1px;">WRAD</div>
+            <div style="font-size:10px; font-weight:bold; background:#450a0a; color:#E10600; padding:2px 6px; border-radius:4px; border:1px solid #E10600;">TINT STUDIO</div>
+        </div>
+        <div style="font-size:11px; color:#a1a1aa; margin-top:-10px; margin-bottom:15px;">
+            Poitiers &amp; alentours • Tél: 07 67 60 10 98 • @wradauto
+        </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("### ⚙️ Rouleau & Tarifs")
+
+    # Sélection du rouleau actif
+    rolls = st.session_state["rolls"]
+    roll_names = [r["nom"] for r in rolls]
+    selected_name = st.selectbox("Rouleau de film actif", roll_names, index=min(st.session_state["active_roll_idx"], len(rolls) - 1))
+    st.session_state["active_roll_idx"] = roll_names.index(selected_name)
+    active_roll = rolls[st.session_state["active_roll_idx"]]
+
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        prix_rouleau = st.number_input("Prix d'achat TTC (€)", value=float(active_roll["prix_achat_ttc"]), min_value=10.0, step=5.0)
+        active_roll["prix_achat_ttc"] = prix_rouleau
+    with col_r2:
+        st.session_state["coeff_prix"] = st.number_input("Coefficient (x)", value=float(st.session_state["coeff_prix"]), min_value=1.0, max_value=10.0, step=0.1)
+
+    cost_per_m = active_roll["prix_achat_ttc"] / active_roll["longueur_m"] if active_roll["longueur_m"] > 0 else 0
+    st.caption(f"Laize: **{active_roll['laize_cm']} cm** • Longueur: **{active_roll['longueur_m']} m** • Coût: **{cost_per_m:.3f} €/m**")
+
+    # Gestion des rouleaux (Ajout & Renommage)
+    with st.expander("🛠️ Gérer / Ajouter des Rouleaux"):
+        st.markdown("**Ajouter un nouveau format :**")
+        new_r_nom = st.text_input("Nom / Réf du rouleau", placeholder="Ex: Teinte 5% Carbone")
+        c_a1, c_a2 = st.columns(2)
+        with c_a1:
+            new_r_lz = st.number_input("Laize (cm)", value=76, step=5)
+        with c_a2:
+            new_r_lg = st.number_input("Longueur (m)", value=30, step=5)
+        new_r_px = st.number_input("Prix d'achat TTC (€)", value=188, step=10)
+
+        if st.button("➕ Enregistrer ce rouleau"):
+            if new_r_nom.strip():
+                new_roll = {
+                    "id": f"roll-{len(rolls) + 1}",
+                    "nom": new_r_nom.strip(),
+                    "laize_cm": float(new_r_lz),
+                    "longueur_m": float(new_r_lg),
+                    "prix_achat_ttc": float(new_r_px)
+                }
+                rolls.append(new_roll)
+                st.session_state["rolls"] = rolls
+                PersistenceManager.save_rolls(rolls)
+                st.success("Nouveau rouleau ajouté avec succès !")
+                st.rerun()
+
+    # Statut & Diagnostic Supabase Cloud
+    st.markdown("---")
+    st.markdown("### ☁️ Supabase Cloud")
+
+    if "supabase_status" not in st.session_state:
+        st.session_state["supabase_status"] = PersistenceManager.test_connection()
+
+    supa_info = st.session_state["supabase_status"]
+    status = supa_info.get("status")
+
+    if status == "connected":
+        st.markdown("""
+            <div style="font-size:12px; color:#22c55e; display:flex; align-items:center; gap:6px;">
+                <span style="height:9px; width:9px; background:#22c55e; border-radius:50%; display:inline-block;"></span>
+                <strong>Supabase Connecté (Sync Active)</strong>
+            </div>
+            <div style="font-size:10px; color:#a1a1aa; margin-top:2px;">
+                Toutes les données sont écrites directement dans vos tables Cloud.
+            </div>
+        """, unsafe_allow_html=True)
+    elif status == "unauthorized":
+        st.markdown("""
+            <div style="font-size:12px; color:#ef4444; display:flex; align-items:center; gap:6px;">
+                <span style="height:9px; width:9px; background:#ef4444; border-radius:50%; display:inline-block;"></span>
+                <strong>Clé Supabase Invalide (401)</strong>
+            </div>
+            <div style="font-size:10px; color:#f87171; margin-top:2px;">
+                Vérifiez votre clé anon dans les secrets Streamlit Cloud ou ci-dessous.
+            </div>
+        """, unsafe_allow_html=True)
+    elif status == "missing_tables":
+        st.markdown(f"""
+            <div style="font-size:12px; color:#f59e0b; display:flex; align-items:center; gap:6px;">
+                <span style="height:9px; width:9px; background:#f59e0b; border-radius:50%; display:inline-block;"></span>
+                <strong>Tables à initialiser</strong>
+            </div>
+            <div style="font-size:10px; color:#fbbf24; margin-top:2px;">
+                {supa_info.get('message', '')}
+            </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+            <div style="font-size:12px; color:#ef4444; display:flex; align-items:center; gap:6px;">
+                <span style="height:9px; width:9px; background:#ef4444; border-radius:50%; display:inline-block;"></span>
+                <strong>Supabase Déconnecté</strong>
+            </div>
+            <div style="font-size:10px; color:#a1a1aa; margin-top:2px;">
+                {supa_info.get('message', 'Vérifiez la connexion réseau')}
+            </div>
+        """, unsafe_allow_html=True)
+
+    # Paramètres avancés & Clés Supabase
+    with st.expander("🔑 Paramètres & Secrets Supabase"):
+        cur_url, cur_key = get_supabase_config()
+        st.caption(f"**URL:** `{cur_url[:28]}...`")
+        st.caption(f"**Clé:** `{cur_key[:16]}...{cur_key[-8:]}`")
+
+        if st.button("🔄 Tester la connexion en direct"):
+            st.session_state["supabase_status"] = PersistenceManager.test_connection()
+            st.rerun()
+
+        st.markdown("**Modifier les identifiants (Session) :**")
+        input_url = st.text_input("URL Supabase", value=cur_url, key="input_supa_url")
+        input_key = st.text_area("Clé Anon Supabase", value=cur_key, height=70, key="input_supa_key")
+
+        if st.button("💾 Appliquer ces identifiants"):
+            st.session_state["custom_supabase_url"] = input_url.strip()
+            st.session_state["custom_supabase_key"] = input_key.strip()
+            st.session_state["supabase_status"] = PersistenceManager.test_connection()
+            st.success("Identifiants appliqués ! Reconnexion en cours...")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("**📋 Configuration Streamlit Cloud (Recommandée) :**")
+        st.caption("Dans Streamlit Cloud > Votre App > Settings > Secrets, collez :")
+        st.code(f'SUPABASE_URL = "{cur_url}"\nSUPABASE_ANON_KEY = "{cur_key}"', language="toml")
+
+        with st.expander("📜 Script SQL de création des tables"):
+            st.caption("Exécutez ce script dans Supabase SQL Editor si vos tables ne sont pas encore créées :")
+            st.code(SUPABASE_SQL_SETUP, language="sql")
+
+
+# =============================================================================
+# ONGLETS PRINCIPAUX DE L'APPLICATION
+# =============================================================================
+tab_estimator, tab_database, tab_clients = st.tabs([
+    "⚡ 1. Estimateur & Plan de Coupe",
+    "📁 2. Base de Données Véhicules",
+    "💼 3. Suivi Clients & Rentabilité"
+])
+
+# -----------------------------------------------------------------------------
+# ONGLET 1 : ESTIMATEUR & PLAN DE COUPE
+# -----------------------------------------------------------------------------
+with tab_estimator:
+    st.subheader("Estimation & Découpe Horizontale")
+
+    # Barre de recherche véhicule
+    col_v1, col_v2, col_v3, col_v4 = st.columns([2, 2, 1.5, 2])
+    with col_v1:
+        s_marque = st.text_input("Marque", value=st.session_state["current_vehicle_info"].get("marque", "Peugeot"))
+    with col_v2:
+        s_modele = st.text_input("Modèle", value=st.session_state["current_vehicle_info"].get("modele", "208"))
+    with col_v3:
+        s_annee = st.text_input("Année", value=st.session_state["current_vehicle_info"].get("annee", "2020"))
+    with col_v4:
+        st.write("")
+        st.write("")
+        btn_search = st.button("⚡ Estimer / Rechercher", use_container_width=True)
+
+    # Exécution de la recherche / estimation
+    if btn_search:
+        key = f"{s_marque.lower().strip()}_{s_modele.lower().strip()}_{s_annee.lower().strip()}"
+        db = PersistenceManager.load_database()
+
+        found = None
+        if key in db:
+            found = db[key]
+        else:
+            for k, v in db.items():
+                if v.get("marque", "").lower() == s_marque.lower() and v.get("modele", "").lower() == s_modele.lower():
+                    found = v
+                    break
+
+        if found:
+            st.session_state["vitres_data"] = found.get("vitres", [])
+            st.session_state["current_vehicle_info"] = found
+            st.success(f"Véhicule chargé en direct depuis Supabase ({len(found.get('vitres', []))} vitres)")
+        else:
+            # Appel IA Gemini
+            try:
+                res = GeminiEstimator.estimate(s_marque, s_modele, s_annee)
+                st.session_state["vitres_data"] = res.get("vitres", [])
+                st.session_state["current_vehicle_info"] = {
+                    "marque": s_marque,
+                    "modele": s_modele,
+                    "annee": s_annee,
+                    "generation": res.get("generation", "Estimé par IA"),
+                    "vitres": res.get("vitres", [])
+                }
+                # Enregistrement direct dans Supabase
+                ok_v, msg_v = PersistenceManager.save_vehicle(key, st.session_state["current_vehicle_info"])
+                if ok_v:
+                    st.success("Dimensions estimées par IA et enregistrées dans votre table Supabase 'vehicles' !")
+                else:
+                    st.info(f"Dimensions estimées par IA prêtes. Note Supabase : {msg_v}")
+            except Exception as e:
+                st.warning(f"Estimation non disponible : {e}")
+
+    # Calculs de métrage & Nesting
+    laize_active = float(active_roll["laize_cm"])
+    marge_active = float(st.session_state["marge_coupe"])
+    coeff = float(st.session_state["coeff_prix"])
+
+    # Vitres arrière vs avant
+    vitres_arr = [v for v in st.session_state["vitres_data"] if v.get("zone") == "arriere"]
+    vitres_av = [v for v in st.session_state["vitres_data"] if v.get("zone") == "avant"]
+
+    nest_arr = StrictHorizontalNestingEngine.compute(vitres_arr, laize_active, marge_active)
+    nest_av = StrictHorizontalNestingEngine.compute(vitres_av, laize_active, marge_active)
+    nest_tot = StrictHorizontalNestingEngine.compute(st.session_state["vitres_data"], laize_active, marge_active)
+
+    # Chiffrages
+    cout_arr = nest_arr["total_linear_m"] * cost_per_m
+    prix_arr = cout_arr * coeff
+
+    cout_av = nest_av["total_linear_m"] * cost_per_m
+    prix_av = cout_av * coeff
+
+    cout_tot = nest_tot["total_linear_m"] * cost_per_m
+    prix_tot = cout_tot * coeff
+
+    # Numéro et date du devis
+    num_devis = f"WRAD-{datetime.now().strftime('%Y%m%d')}-{datetime.now().strftime('%H%M')}"
+    date_str = datetime.now().strftime("%d/%m/%Y")
+
+    # Affichage des 3 cartes financières avec boutons Devis dédiés
+    st.markdown("#### 💰 Chiffrages & Devis par Prestation")
+    card_col1, card_col2, card_col3 = st.columns(3)
+
+    with card_col1:
+        st.markdown(f"""
+            <div style="background:{COLOR_PANEL}; border:1px solid {COLOR_BORDER}; padding:14px; border-radius:10px;">
+                <div style="font-weight:bold; color:{COLOR_RED_WRAD}; font-size:14px;">PACK 3/4 ARRIÈRE</div>
+                <div style="font-size:11px; color:#a1a1aa; margin-top:2px;">Lunette + latérales arrière + custodes</div>
+                <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:10px;">
+                    <div>
+                        <div style="font-size:10px; color:#a1a1aa;">Métrage requis</div>
+                        <div style="font-size:18px; font-weight:bold; color:#ffffff;">{nest_arr['total_linear_m']:.2f} m</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div style="font-size:10px; color:#a1a1aa;">Tarif conseillé TTC</div>
+                        <div style="font-size:22px; font-weight:900; color:{COLOR_PRICE_GOLD};">{prix_arr:.2f} €</div>
+                    </div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        pdf_arr_bytes = WradPDFGenerator.generate_pdf_bytes(
+            devis_num=num_devis,
+            date_str=date_str,
+            vehicule=st.session_state["current_vehicle_info"],
+            prestation_title="PACK 3/4 ARRIÈRE",
+            prestation_desc="Lunette arrière + vitres latérales arrière + custodes arrière",
+            metrage_m=nest_arr["total_linear_m"],
+            prix_ttc=prix_arr,
+            roll_nom=active_roll["nom"],
+            laize_cm=laize_active
+        )
+        if pdf_arr_bytes:
+            st.download_button(
+                label="📄 Télécharger Devis 3/4 Arrière (PDF)",
+                data=pdf_arr_bytes,
+                file_name=f"Devis_WRAD_{s_marque}_{s_modele}_Arriere.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="btn_pdf_arr"
+            )
+
+    with card_col2:
+        st.markdown(f"""
+            <div style="background:{COLOR_PANEL}; border:1px solid {COLOR_BORDER}; padding:14px; border-radius:10px;">
+                <div style="font-weight:bold; color:#FFFFFF; font-size:14px;">PACK VITRES AVANT</div>
+                <div style="font-size:11px; color:#a1a1aa; margin-top:2px;">Vitres latérales avant + custodes avant</div>
+                <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:10px;">
+                    <div>
+                        <div style="font-size:10px; color:#a1a1aa;">Métrage requis</div>
+                        <div style="font-size:18px; font-weight:bold; color:#ffffff;">{nest_av['total_linear_m']:.2f} m</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div style="font-size:10px; color:#a1a1aa;">Tarif conseillé TTC</div>
+                        <div style="font-size:22px; font-weight:900; color:{COLOR_PRICE_GOLD};">{prix_av:.2f} €</div>
+                    </div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        pdf_av_bytes = WradPDFGenerator.generate_pdf_bytes(
+            devis_num=num_devis,
+            date_str=date_str,
+            vehicule=st.session_state["current_vehicle_info"],
+            prestation_title="PACK VITRES AVANT",
+            prestation_desc="Vitres latérales avant + custodes avant (Conforme TLV ≥ 70%)",
+            metrage_m=nest_av["total_linear_m"],
+            prix_ttc=prix_av,
+            roll_nom=active_roll["nom"],
+            laize_cm=laize_active
+        )
+        if pdf_av_bytes:
+            st.download_button(
+                label="📄 Télécharger Devis Vitres Avant (PDF)",
+                data=pdf_av_bytes,
+                file_name=f"Devis_WRAD_{s_marque}_{s_modele}_Avant.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="btn_pdf_av"
+            )
+
+    with card_col3:
+        st.markdown(f"""
+            <div style="background:#1c1414; border:1px solid {COLOR_RED_WRAD}; padding:14px; border-radius:10px;">
+                <div style="font-weight:bold; color:{COLOR_RED_WRAD}; font-size:14px;">TOTAL VÉHICULE COMPLET</div>
+                <div style="font-size:11px; color:#a1a1aa; margin-top:2px;">Ensemble des vitres avant et arrière</div>
+                <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-top:10px;">
+                    <div>
+                        <div style="font-size:10px; color:#a1a1aa;">Métrage global</div>
+                        <div style="font-size:18px; font-weight:bold; color:#ffffff;">{nest_tot['total_linear_m']:.2f} m</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div style="font-size:10px; color:#a1a1aa;">Total recommandé</div>
+                        <div style="font-size:22px; font-weight:900; color:{COLOR_PRICE_GOLD};">{prix_tot:.2f} €</div>
+                    </div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        pdf_tot_bytes = WradPDFGenerator.generate_pdf_bytes(
+            devis_num=num_devis,
+            date_str=date_str,
+            vehicule=st.session_state["current_vehicle_info"],
+            prestation_title="VÉHICULE COMPLET (TOUS PACKS)",
+            prestation_desc="Lunette arrière + latérales arrière + custodes arrière + vitres avant",
+            metrage_m=nest_tot["total_linear_m"],
+            prix_ttc=prix_tot,
+            roll_nom=active_roll["nom"],
+            laize_cm=laize_active
+        )
+        if pdf_tot_bytes:
+            st.download_button(
+                label="📄 Télécharger Devis Complet (PDF)",
+                data=pdf_tot_bytes,
+                file_name=f"Devis_WRAD_{s_marque}_{s_modele}_Complet.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="btn_pdf_tot"
+            )
+
+    st.markdown("---")
+
+    # Split interactif : Tableau des dimensions à gauche & Plan de coupe à droite
+    col_table, col_plan = st.columns([1.1, 1])
+
+    with col_table:
+        st.markdown("##### 📋 Cotes des Vitres (Modifiables en direct)")
+        st.caption("Sens horizontal strict : Hauteur ➜ Laize | Largeur ➜ Longueur déroulé")
+
+        # Tableau éditable natif Streamlit
+        edited_vitres = st.data_editor(
+            st.session_state["vitres_data"],
+            column_config={
+                "included": st.column_config.CheckboxColumn("Inclus", default=True),
+                "nom": st.column_config.TextColumn("Nom de la vitre", required=True),
+                "hauteur_cm": st.column_config.NumberColumn("Hauteur (cm)", min_value=5, max_value=200, step=1, required=True),
+                "largeur_cm": st.column_config.NumberColumn("Largeur (cm)", min_value=5, max_value=300, step=1, required=True),
+                "zone": st.column_config.SelectboxColumn("Zone", options=["arriere", "avant"], required=True),
+            },
+            num_rows="dynamic",
+            use_container_width=True,
+            key="vitres_editor"
+        )
+        st.session_state["vitres_data"] = edited_vitres
+
+        if st.button("💾 Sauvegarder cette fiche véhicule dans Supabase"):
+            key = f"{s_marque.lower().strip()}_{s_modele.lower().strip()}_{s_annee.lower().strip()}"
+            veh_to_save = {
+                "marque": s_marque,
+                "modele": s_modele,
+                "annee": s_annee,
+                "generation": st.session_state["current_vehicle_info"].get("generation", "Manuel"),
+                "vitres": edited_vitres
+            }
+            PersistenceManager.save_vehicle(key, veh_to_save)
+            st.success(f"Fiche {s_marque} {s_modele} enregistrée en direct sur Supabase !")
+
+    with col_plan:
+        st.markdown(f"##### 📐 Plan de Coupe 2D (Laize {laize_active:.0f} cm)")
+        st.caption(f"Efficacité matière : **{nest_tot['efficiency_pct']}%** • Déroulé : **{nest_tot['total_linear_m']:.2f} m** ({nest_tot['total_linear_cm']:.0f} cm)")
+
+        plan_mode = st.radio(
+            "Vue du plan :",
+            ["📐 Schéma Vectoriel HTML5 (Interactif)", "📊 Graphique Matplotlib"],
+            horizontal=True,
+            key="plan_view_choice"
+        )
+
+        if plan_mode == "📐 Schéma Vectoriel HTML5 (Interactif)":
+            if nest_tot.get("svg_html"):
+                components.html(nest_tot["svg_html"], height=480, scrolling=True)
+            else:
+                st.info("Aucune vitre à afficher.")
+        else:
+            if HAS_MATPLOTLIB:
+                fig = StrictHorizontalNestingEngine.generate_matplotlib_fig(
+                    nest_tot["placed"],
+                    laize_active,
+                    nest_tot["total_linear_cm"],
+                    nest_tot["total_linear_m"],
+                    nest_tot["has_seam_warning"]
+                )
+                if fig:
+                    st.pyplot(fig, use_container_width=True)
+                else:
+                    st.info("Aucune découpe à afficher.")
+            else:
+                st.info("Matplotlib n'est pas encore installé (disponible avec `pip install matplotlib`). Affichage vectoriel HTML5 :")
+                if nest_tot.get("svg_html"):
+                    components.html(nest_tot["svg_html"], height=480, scrolling=True)
+
+
+# -----------------------------------------------------------------------------
+# ONGLET 2 : BASE DE DONNÉES VÉHICULES (SUPABASE)
+# -----------------------------------------------------------------------------
+with tab_database:
+    st.subheader("Base de Données Véhicules & Cotes (Supabase Cloud)")
+    st.caption("Consultez, ajoutez et personnalisez votre catalogue de vitrages sauvegardé en temps réel sur Supabase.")
+
+    # FORMULAIRE CLAIR D'AJOUT D'UN VÉHICULE PERSONNALISÉ
+    with st.expander("➕ Ajouter manuellement un Nouveau Véhicule & Cotes Personnalisées dans Supabase", expanded=True):
+        st.markdown("##### 1. Informations générales du véhicule")
+        c_nv1, c_nv2, c_nv3 = st.columns(3)
+        with c_nv1:
+            nv_marque = st.text_input("Marque du véhicule *", placeholder="Ex: BMW, Peugeot, Tesla...", key="custom_v_marque")
+        with c_nv2:
+            nv_modele = st.text_input("Modèle du véhicule *", placeholder="Ex: Série 3, 308, Model Y...", key="custom_v_modele")
+        with c_nv3:
+            nv_annee = st.text_input("Année / Génération", placeholder="Ex: 2023 - G20 Phase 2", key="custom_v_annee")
+
+        st.markdown("##### 2. Saisie des cotes des vitres")
+        st.caption("Sens horizontal strict : **Hauteur (cm)** ➜ Laize | **Largeur (cm)** ➜ Longueur déroulée")
+
+        # Sous-formulaire d'ajout rapide d'une vitre avec bouton "Ajouter au véhicule"
+        col_w1, col_w2, col_w3, col_w4, col_w5 = st.columns([3, 1.8, 1.8, 2.4, 2.2])
+        with col_w1:
+            w_nom = st.text_input("Nom de la vitre", placeholder="Ex: Lunette AR, Vitre AR gauche...", key="custom_w_nom")
+        with col_w2:
+            w_h = st.number_input("Hauteur (cm)", value=50, min_value=5, max_value=200, step=1, key="custom_w_h")
+        with col_w3:
+            w_w = st.number_input("Largeur (cm)", value=70, min_value=5, max_value=300, step=1, key="custom_w_w")
+        with col_w4:
+            w_z = st.selectbox("Zone", ["Pack 3/4 Arrière", "Pack Vitres Avant"], key="custom_w_zone")
+        with col_w5:
+            st.write("")
+            st.write("")
+            btn_add_window = st.button("➕ Ajouter au véhicule", use_container_width=True)
+
+        if btn_add_window:
+            if w_nom.strip():
+                st.session_state["manual_new_vehicle_vitres"].append({
+                    "nom": w_nom.strip(),
+                    "hauteur_cm": int(w_h),
+                    "largeur_cm": int(w_w),
+                    "zone": "arriere" if "Arrière" in w_z else "avant",
+                    "included": True
+                })
+                st.success(f"Vitre '{w_nom.strip()}' ajoutée à la fiche du véhicule !")
+                st.rerun()
+            else:
+                st.error("Veuillez renseigner un nom pour la vitre (ex: Lunette arrière).")
+
+        # Raccourcis pratiques
+        col_g1, col_g2, col_g3 = st.columns([2.5, 2.5, 3])
+        with col_g1:
+            if st.button("⚡ Charger gabarit Berline standard (7 vitres)"):
+                st.session_state["manual_new_vehicle_vitres"] = [
+                    {"nom": "Lunette arrière", "hauteur_cm": 52, "largeur_cm": 98, "zone": "arriere", "included": True},
+                    {"nom": "Vitre latérale AR gauche", "hauteur_cm": 44, "largeur_cm": 56, "zone": "arriere", "included": True},
+                    {"nom": "Vitre latérale AR droite", "hauteur_cm": 44, "largeur_cm": 56, "zone": "arriere", "included": True},
+                    {"nom": "Custode AR gauche", "hauteur_cm": 28, "largeur_cm": 22, "zone": "arriere", "included": True},
+                    {"nom": "Custode AR droite", "hauteur_cm": 28, "largeur_cm": 22, "zone": "arriere", "included": True},
+                    {"nom": "Vitre latérale AV gauche", "hauteur_cm": 48, "largeur_cm": 72, "zone": "avant", "included": True},
+                    {"nom": "Vitre latérale AV droite", "hauteur_cm": 48, "largeur_cm": 72, "zone": "avant", "included": True},
+                ]
+                st.rerun()
+        with col_g2:
+            if st.button("🧹 Réinitialiser les vitres"):
+                st.session_state["manual_new_vehicle_vitres"] = []
+                st.rerun()
+
+        # Éditeur dynamique pour ajuster ou supprimer les vitres avant d'enregistrer
+        st.markdown(f"**Vitres configurées pour ce véhicule ({len(st.session_state['manual_new_vehicle_vitres'])} vitres) :**")
+        edited_manual_vitres = st.data_editor(
+            st.session_state["manual_new_vehicle_vitres"],
+            column_config={
+                "included": st.column_config.CheckboxColumn("Inclus", default=True),
+                "nom": st.column_config.TextColumn("Nom de la vitre", required=True),
+                "hauteur_cm": st.column_config.NumberColumn("Hauteur (cm)", min_value=5, max_value=200, step=1, required=True),
+                "largeur_cm": st.column_config.NumberColumn("Largeur (cm)", min_value=5, max_value=300, step=1, required=True),
+                "zone": st.column_config.SelectboxColumn("Zone", options=["arriere", "avant"], required=True),
+            },
+            num_rows="dynamic",
+            use_container_width=True,
+            key="editor_manual_new_vitres"
+        )
+        st.session_state["manual_new_vehicle_vitres"] = edited_manual_vitres
+
+        # Bouton d'enregistrement Supabase
+        if st.button("💾 Enregistrer ce véhicule et ses dimensions dans Supabase", use_container_width=True, type="primary"):
+            if not nv_marque.strip() or not nv_modele.strip():
+                st.error("La marque et le modèle sont obligatoires pour enregistrer le véhicule.")
+            elif not edited_manual_vitres or len(edited_manual_vitres) == 0:
+                st.error("Ajoutez au moins une vitre avec ses cotes avant d'enregistrer.")
+            else:
+                key_veh = f"{nv_marque.lower().strip()}_{nv_modele.lower().strip()}_{nv_annee.lower().strip()}".strip("_")
+                new_veh_data = {
+                    "marque": nv_marque.strip(),
+                    "modele": nv_modele.strip(),
+                    "annee": nv_annee.strip(),
+                    "generation": nv_annee.strip() or "Saisie Manuelle",
+                    "vitres": edited_manual_vitres
+                }
+                ok_s, msg_s = PersistenceManager.save_vehicle(key_veh, new_veh_data)
+                if ok_s:
+                    st.session_state["manual_new_vehicle_vitres"] = []
+                    st.success(f"Véhicule {nv_marque.strip()} {nv_modele.strip()} avec {len(edited_manual_vitres)} vitres enregistré avec succès dans Supabase !")
+                    st.rerun()
+                else:
+                    st.error(f"Échec de l'enregistrement dans Supabase : {msg_s}")
+
+    st.markdown("---")
+    c_head1, c_head2 = st.columns([4, 1.5])
+    with c_head1:
+        st.markdown("##### 🚗 Véhicules enregistrés dans Supabase")
+    with c_head2:
+        if st.button("🔄 Actualiser Supabase", key="refresh_db_top"):
+            st.rerun()
+
+    db_vehicles = PersistenceManager.load_database()
+
+    search_db = st.text_input("🔍 Filtrer la base par marque ou modèle...", "")
+    filtered_keys = [
+        k for k, v in db_vehicles.items()
+        if search_db.lower() in v.get("marque", "").lower()
+        or search_db.lower() in v.get("modele", "").lower()
+        or search_db.lower() in v.get("generation", "").lower()
+    ]
+
+    if not db_vehicles:
+        st.info("Aucun véhicule dans la table Supabase 'vehicles'. Ajoutez un véhicule ci-dessus pour le synchroniser en direct !")
+    else:
+        st.markdown(f"**{len(filtered_keys)}** véhicules disponibles :")
+
+    for k in filtered_keys:
+        v = db_vehicles[k]
+        with st.container():
+            c1, c2, c3 = st.columns([3, 1.5, 1])
+            with c1:
+                st.markdown(f"**{v.get('marque')} {v.get('modele')}** ({v.get('annee', 'N/A')})")
+                st.caption(f"{v.get('generation', '')} • {len(v.get('vitres', []))} vitres enregistrées")
+            with c2:
+                if st.button("⚡ Charger dans l'estimateur", key=f"load_{k}", use_container_width=True):
+                    st.session_state["vitres_data"] = v.get("vitres", [])
+                    st.session_state["current_vehicle_info"] = v
+                    st.success(f"Véhicule {v.get('marque')} {v.get('modele')} chargé !")
+                    st.rerun()
+            with c3:
+                if st.button("🗑️ Supprimer", key=f"del_{k}", help="Supprimer définitivement ce véhicule de Supabase"):
+                    ok_d, msg_d = PersistenceManager.delete_vehicle(k)
+                    if ok_d:
+                        st.warning("Véhicule supprimé de la table Supabase.")
+                        st.rerun()
+                    else:
+                        st.error(f"Erreur de suppression dans Supabase : {msg_d}")
+            st.markdown("<hr style='margin:4px 0 12px 0; border-color:#27272a;'>", unsafe_allow_html=True)
+
+
+# -----------------------------------------------------------------------------
+# ONGLET 3 : SUIVI CLIENTS & RENTABILITÉ (SUPABASE)
+# -----------------------------------------------------------------------------
+with tab_clients:
+    st.subheader("Suivi Commercial & Rentabilité Réelle Wrad")
+    st.caption("Données synchronisées en direct avec Supabase entre votre ordinateur et votre smartphone.")
+
+    clients_list = PersistenceManager.load_clients()
+
+    # Calcul des totaux KPI
+    tot_ca = sum(float(c.get("prixFactureTTC", 0)) for c in clients_list)
+    tot_cout = sum(float(c.get("coutRevientTTC", 0)) for c in clients_list)
+    tot_benef = tot_ca - tot_cout
+    tot_metres = sum(float(c.get("metrageUtiliseM", 0)) for c in clients_list)
+    avg_marge = (tot_benef / tot_ca * 100.0) if tot_ca > 0 else 0.0
+
+    # Affichage des métriques financières
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("Chiffre d'Affaires Total", f"{tot_ca:.2f} €", f"{len(clients_list)} prestations")
+    kpi2.metric("Coût Matière Total", f"{tot_cout:.2f} €")
+    kpi3.metric("Bénéfice Net Réel", f"+{tot_benef:.2f} €", f"Marge : {avg_marge:.1f}%")
+    kpi4.metric("Métrage Total Posé", f"{tot_metres:.2f} m")
+
+    st.markdown("---")
+
+    # Formulaire de saisie d'une nouvelle pose client
+    with st.expander("➕ Enregistrer une Prestation & Calculer la Rentabilité", expanded=True):
+        f_c1, f_c2 = st.columns(2)
+        with f_c1:
+            in_cli_nom = st.text_input("Nom du Client / Garage *", placeholder="Ex: M. Dupont ou Garage XYZ")
+            in_cli_veh = st.text_input("Véhicule Traité *", value=f"{st.session_state['current_vehicle_info'].get('marque', '')} {st.session_state['current_vehicle_info'].get('modele', '')}".strip())
+            in_cli_pack = st.selectbox("Prestation Réalisée", ["Pack 3/4 Arrière", "Pack Vitres Avant", "Véhicule Complet", "Sur Mesure"])
+
+        with f_c2:
+            in_cli_metres = st.number_input("Métrage linéaire réel utilisé (m)", value=float(nest_tot["total_linear_m"]) or 2.0, step=0.1)
+            in_cli_prix = st.number_input("Prix réellement facturé TTC (€)", value=float(prix_tot) or 150.0, step=10.0)
+            in_cli_notes = st.text_input("Notes (optionnel)", placeholder="Ex: Teinte 15% - pose à domicile")
+
+        # Calculs instantanés du formulaire
+        cout_revient = round(in_cli_metres * cost_per_m, 2)
+        benef_net = round(in_cli_prix - cout_revient, 2)
+        marge_pct = round((benef_net / in_cli_prix * 100.0), 1) if in_cli_prix > 0 else 0.0
+
+        st.info(f"💡 Coût matière estimé : **{cout_revient:.2f} €** ➜ **Bénéfice net réalisé : +{benef_net:.2f} €** ({marge_pct}% de marge)")
+
+        if st.button("Enregistrer la Prestation sur Supabase", use_container_width=True):
+            if in_cli_nom.strip() and in_cli_veh.strip():
+                new_record = {
+                    "id": f"cli-{int(datetime.now().timestamp())}",
+                    "clientNom": in_cli_nom.strip(),
+                    "vehicule": in_cli_veh.strip(),
+                    "datePose": datetime.now().strftime("%Y-%m-%d"),
+                    "pack": in_cli_pack,
+                    "metrageUtiliseM": in_cli_metres,
+                    "prixFactureTTC": in_cli_prix,
+                    "coutRevientTTC": cout_revient,
+                    "beneficeNetTTC": benef_net,
+                    "tauxMargePercent": marge_pct,
+                    "notes": in_cli_notes.strip()
+                }
+                ok_c, msg_c = PersistenceManager.save_client_record(new_record)
+                if ok_c:
+                    st.success(f"Prestation enregistrée avec succès dans Supabase ! Bénéfice : +{benef_net:.2f} €")
+                    st.rerun()
+                else:
+                    st.error(f"Échec de l'enregistrement dans Supabase : {msg_c}")
+            else:
+                st.error("Le nom du client et le véhicule sont obligatoires.")
+
+    # Tableau des prestations enregistrées avec bouton Supprimer individuel par ligne
+    c_th1, c_th2 = st.columns([4, 1.5])
+    with c_th1:
+        st.markdown("##### 📜 Historique des Poses Clients (Synchronisé Supabase)")
+    with c_th2:
+        if st.button("🔄 Actualiser Clients", key="refresh_clients_top"):
+            st.rerun()
+
+    if clients_list:
+        # En-tête des colonnes du tableau
+        h_cols = st.columns([1.1, 1.8, 1.8, 1.4, 1.0, 1.1, 1.1, 1.1])
+        h_cols[0].markdown("**Date**")
+        h_cols[1].markdown("**Client**")
+        h_cols[2].markdown("**Véhicule**")
+        h_cols[3].markdown("**Prestation**")
+        h_cols[4].markdown("**Métrage**")
+        h_cols[5].markdown("**Facturé**")
+        h_cols[6].markdown("**Bénéfice**")
+        h_cols[7].markdown("**Action**")
+
+        st.markdown("<hr style='margin:2px 0 8px 0; border-color:#3f3f46;'>", unsafe_allow_html=True)
+
+        for idx, c in enumerate(clients_list):
+            cid = str(c.get("id"))
+            row_cols = st.columns([1.1, 1.8, 1.8, 1.4, 1.0, 1.1, 1.1, 1.1])
+            with row_cols[0]:
+                st.caption(c.get("datePose") or "-")
+            with row_cols[1]:
+                st.markdown(f"**{c.get('clientNom', 'Client')}**")
+            with row_cols[2]:
+                st.write(c.get("vehicule") or "-")
+            with row_cols[3]:
+                st.caption(c.get("pack") or "-")
+            with row_cols[4]:
+                st.write(f"{float(c.get('metrageUtiliseM', 0)):.2f} m")
+            with row_cols[5]:
+                st.markdown(f"**{float(c.get('prixFactureTTC', 0)):.2f} €**")
+            with row_cols[6]:
+                benef = float(c.get("beneficeNetTTC", 0))
+                st.markdown(f"<span style='color:#22c55e; font-weight:bold;'>+{benef:.2f} €</span>", unsafe_allow_html=True)
+            with row_cols[7]:
+                if st.button("🗑️ Suppr.", key=f"btn_del_client_{cid}_{idx}", help=f"Supprimer la pose de {c.get('clientNom')} de Supabase"):
+                    ok_del, msg_del = PersistenceManager.delete_client_record(cid)
+                    if ok_del:
+                        st.success(f"Prestation de {c.get('clientNom')} supprimée de Supabase !")
+                        st.rerun()
+                    else:
+                        st.error(f"Erreur de suppression dans Supabase : {msg_del}")
+
+            st.markdown("<hr style='margin:2px 0 6px 0; border-color:#27272a;'>", unsafe_allow_html=True)
+
+        # Export CSV
+        csv_buffer = io.StringIO()
+        csv_buffer.write("ID,Date,Client,Vehicule,Pack,Metrage_m,Prix_Facture_TTC,Cout_Revient_TTC,Benefice_Net_TTC,Taux_Marge_Pct\n")
+        for c in clients_list:
+            csv_buffer.write(f'"{c.get("id")}","{c.get("datePose")}","{c.get("clientNom")}","{c.get("vehicule")}","{c.get("pack")}",{c.get("metrageUtiliseM")},{c.get("prixFactureTTC")},{c.get("coutRevientTTC")},{c.get("beneficeNetTTC")},{c.get("tauxMargePercent")}\n')
+
+        st.download_button(
+            label="📥 Exporter la comptabilité clients en CSV",
+            data=csv_buffer.getvalue(),
+            file_name=f"Wrad_Suivi_Clients_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("Aucune prestation client enregistrée pour l'instant dans Supabase.")
